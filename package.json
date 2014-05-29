@@ -1,0 +1,11 @@
+{
+  "name": "tensor-decomposition",
+  "version": "0.0.0",
+  "description": "Decomposition of (higher order) tensors.",
+  "main": "decompose.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "author": "Jasper van de Gronde",
+  "license": "MIT"
+}
