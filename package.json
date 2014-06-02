@@ -1,11 +1,18 @@
 {
   "name": "tensor-decomposition",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "Decomposition of (higher order) tensors.",
   "main": "decompose.js",
   "scripts": {
     "test": "node test.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jaspervdg/tensor-decomposition.git"
+  },
   "author": "Jasper van de Gronde",
-  "license": "MIT"
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/jaspervdg/tensor-decomposition/issues"
+  }
 }
