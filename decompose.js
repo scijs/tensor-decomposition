@@ -4,6 +4,7 @@
 // should not be a problem.
 // TODO: Generalize to higher dimensions (much of it is already general, but specifically the frame building part is very 2D specific).
 //       Two things depend on having a frame: ensuring convergence of the power method (although this uses a heuristic, so it might not even work, or be too extreme), and finding an initialization for the power method.
+//       Another thing that might have to be changed when going to higher dimensions is the way the identity tensor is used.
 
 var assert = require("assert")
 
@@ -18,6 +19,7 @@ function decompose(A, eps) {
   var epsSqr = eps*eps
   var epsVSqr = Math.pow(1e-8, 2)
   var epsLambda = eps
+  var epsLambdaSqr = epsLambda*epsLambda
 
   var n = A.length-1
   var d = 2
@@ -30,18 +32,18 @@ function decompose(A, eps) {
   var Id = constructIdentityTensor(n, d)
 
   // Find initial decomposition
-  var Ar, v, v_4, lambda, vList = [], v_4List = [], lambdaList = []
+  var Ar, vobj, v, grade, v_t, lambda, vList = [], gradeList = [], v_tList = [], lambdaList = []
   var i, oldv, ind, Apr, iter, numconverged
+  var VA, Vl, VVl//, lambdaDiffSqr
   Ar = A.slice()
   while(tensorDot(Ar,Ar) > epsSqr) {
     // Find best rank one approximation using S-HOPM
-    v = bestRankOne(Ar, epsVSqr, F, Fv, Id, tensorDot, tensorFromVectorNminOne, partialInnerProduct)
-    v_4 = tensorFromVector(v)
-    lambda = tensorDot(Ar,v_4)
-    //console.log([lambda, v])
+    vobj = bestApprox(Ar, undefined, epsVSqr, F, Fv, Id, tensorFromVector, tensorDot, tensorFromVectorNminOne, partialInnerProduct)
+    lambda = vobj.lambda
     if (lambda < epsLambda) break // As soon as we get a value that is too small or NEGATIVE, just abort
-    vList.push(v)
-    v_4List.push(v_4)
+    vList.push(vobj.v)
+    gradeList.push(vobj.grade)
+    v_tList.push(vobj.v_t)
     lambdaList.push(lambda)
 
     // Now refine the decomposition using a "leave one out" scheme
@@ -49,18 +51,19 @@ function decompose(A, eps) {
       ind = 0
       for(iter=0; iter<10000; iter++) {
         if (ind === 0) numconverged = 0
+        // Find best replacement for vList[ind]
         Ar = newZeroArray(A.length)
-        for(i=0; i<v_4List.length; i++) {
+        for(i=0; i<v_tList.length; i++) {
           if (i===ind) continue
-          vec_muladdeq(Ar, lambdaList[i], v_4List[i])
+          vec_muladdeq(Ar, lambdaList[i], v_tList[i])
         }
         Ar = vec_sub(A,Ar) // Residue after subtracting everything except the current vector
-        oldv = vList[ind].slice()
-        v = bestRankOne(Ar, epsVSqr, F, Fv, Id, tensorDot, tensorFromVectorNminOne, partialInnerProduct)
-        v_4 = tensorFromVector(v)
-        lambda = Math.max(0, tensorDot(Ar,v_4))
-        //console.log(lambda)
-        if (Math.pow(v[0]-oldv[0],2)+Math.pow(v[1]-oldv[1],2) < epsVSqr || Math.pow(v[0]+oldv[0],2)+Math.pow(v[1]+oldv[1],2) < epsSqr) { // Also check for "oscillating" convergence (in principle we can end up on the opposite vector)
+        oldv = vList[ind]
+        vobj = bestApprox(Ar, gradeList[ind], epsVSqr, F, Fv, Id, tensorFromVector, tensorDot, tensorFromVectorNminOne, partialInnerProduct) // Keep grade
+        v = vobj.v
+        if (v === undefined) console.log([vobj, oldv, gradeList[ind]])
+        lambda = Math.max(0, vobj.lambda)
+        if (vec_diffo_sqr(v, oldv) < epsVSqr) { // Also checks for v = -oldv
           numconverged++
           if (numconverged === vList.length) {
             //console.log("Breaking refinement after " + (iter+1) + " iterations.")
@@ -68,19 +71,46 @@ function decompose(A, eps) {
           }
         }
         vList[ind] = v
-        v_4List[ind] = v_4
+        v_tList[ind] = vobj.v_t
         lambdaList[ind] = lambda
         ind = (ind+1) % vList.length // cycle through indices
       }
       if (numconverged < vList.length) {
         console.warn("Refinement failed.")
       }
+      // Minimize residual using non-negative least squares based on multiplicative updates
+      // We minimize \|A - V\lambda\|^2, using the update rule \lambda'_i = \lambda_i (V^T A)_i / (V^TV\lambda)_i
+      // Note that this relies on the (seemingly reasonable) idea that V^T A should not contain negative values, given that A is assumed to be (almost) positive semi-definite.
+      // V^TV must have only non-negative entries, since we only use positive semi-definite tensors for building V (at worst we could have round-off errors causing some very small negative values, but these are unlikely to cause problems, as VVl always also contains a component corresponding to the product of the current value of lambda and the norm of the tensor in question.
+      VA = new Array(v_tList.length)
+      for(i=0; i<v_tList.length; i++) {
+        VA[i] = tensorDot(A, v_tList[i])
+        if (VA[i] < 0) console.warn("VA[i] < 0")
+        VA[i] = Math.max(0, VA[i]) // This is not really supposed to happen, but in case it does, let's try to prevent oscillations (instead, the corresponding lambda will probably be set to zero)
+      }
+      VVl = new Array(v_tList.length)
+      for(nnlsiter=0; nnlsiter<1000; nnlsiter++) {
+        Vl = newZeroArray(A.length)
+        for(i=0; i<v_tList.length; i++) {
+          vec_muladdeq(Vl, lambdaList[i], v_tList[i])
+        }
+        //lambdaDiffSqr = 0
+        for(i=0; i<v_tList.length; i++) {
+          VVl[i] = tensorDot(Vl, v_tList[i])
+          lambda = lambdaList[i] * (VA[i] + epsLambda*1e-6) / (VVl[i] + epsLambda*1e-6)
+          //lambdaDiffSqr += Math.pow(lambda - lambdaList[i], 2)
+          lambdaList[i] = lambda
+          if (VVl[i] < 0) console.warn("VVl[i] < 0")
+        }
+        //if (lambdaDiffSqr < epsLambdaSqr) break
+      }
+      // TODO: In theory it should be possible to remove vectors whose lambda has decreased to below some threshold, but it's a little tricky to then guarantee that we do not end up in an infinite loop.
     }
 
     // Determine residual for next iteration
     Ar = newZeroArray(A.length)
-    for(i=0; i<v_4List.length; i++) {
-      vec_muladdeq(Ar, lambdaList[i], v_4List[i])
+    for(i=0; i<v_tList.length; i++) {
+      vec_muladdeq(Ar, lambdaList[i], v_tList[i])
     }
     Ar = vec_sub(A,Ar) // Residue after subtracting everything except the current vector
   }
@@ -91,16 +121,44 @@ function decompose(A, eps) {
   }
 
   // Return coefficients and vectors
-  return [lambdaList, vList]
+  return {lambda: lambdaList, v: vList, grade: gradeList}
+}
+
+function bestApprox(A, grade, epsSqr, F, Fv, Id, tensorFromVector, tensorDot, tFVNMO, pip) {
+  var v, v_t, lambda, v2, v2_t, lambda2, bestErr, err, Ar, newgrade = grade
+  if (grade === 1 || grade === undefined) {
+    v = bestRankOne(A, epsSqr, F, Fv, Id, tensorDot, tFVNMO, pip)
+    v_t = tensorFromVector(v)
+    lambda = tensorDot(A, v_t)
+    if (grade === undefined) {
+      Ar = vec_muladdeq(A.slice(), -lambda, v_t)
+      bestErr = tensorDot(Ar, Ar)
+    }
+    newgrade = 1
+  }
+  if (grade === 2 || grade === undefined) {
+    v2 = []
+    v2_t = Id
+    lambda2 = tensorDot(A, v2_t)/tensorDot(v2_t, v2_t)
+    if (grade === undefined) {
+      Ar = vec_muladdeq(A.slice(), -lambda2, v2_t)
+      err = tensorDot(Ar, Ar)
+    }
+    if (grade === 2 || err < bestErr) {
+      v = v2
+      v_t = v2_t
+      lambda = lambda2
+      newgrade = 2
+    }
+  }
+  return {v: v, v_t: v_t, lambda: lambda, grade: newgrade}
 }
 
 function bestRankOne(A, epsSqr, F, Fv, Id, tensorDot, tFVNMO, pip) { // Symmetric higher order power method
   var v3, vnorm, oldv
-  //console.log("A: " + A)
   var pdres = makePositiveDefinite(A, F, Fv, Id, tensorDot) // should ensure convergence
   A = pdres.A
   var v = pdres.v // TODO: Allow different initializations/suggestions?
-  //console.log("A+: " + A)
   for(var i=0; i<100; i++) { // TODO: Accelerate convergence
     v3 = tFVNMO(v)
     oldv = v
@@ -123,21 +181,9 @@ function bestRankOne(A, epsSqr, F, Fv, Id, tensorDot, tFVNMO, pip) { // Symmetri
       //console.log("Breaking power method after " + (i+1) + " iterations.")
       return v
     }
-    //console.log(v)
   }
   var err = Math.min(Math.pow(v[0]-oldv[0],2)+Math.pow(v[1]-oldv[1],2), Math.pow(v[0]+oldv[0],2)+Math.pow(v[1]+oldv[1],2))
   console.warn("Symmetric higher order power method failed! Remaining error^2: " + err + " > " + epsSqr)
-  /*console.log(A)
-  for(var i=0; i<10; i++) {
-    v3 = tFVNMO(v)
-    oldv = v
-    v = [A[0]*v3[0] + 0.86602540378443864676*A[1]*v3[1] + 0.7071067811865475244*A[2]*v3[2] + 0.5*A[3]*v3[3],
-         0.5*A[1]*v3[0] + 0.7071067811865475244*A[2]*v3[1] + 0.86602540378443864676*A[3]*v3[2] + A[4]*v3[3]]
-    vnorm = Math.sqrt(v[0]*v[0] + v[1]*v[1])
-    v[0] /= vnorm
-    v[1] /= vnorm
-    console.log(v)
-  }*/
   return v
 }
 
@@ -374,13 +420,14 @@ function vec_sub(a, b) {
   return c
 }
 
-/*function vec_dot(a, b) {
-  var dot = 0
+function vec_diffo_sqr(a, b) {
+  var d1 = 0, d2 = 0
   for(var i=0; i<a.length; i++) {
-    dot += a[i]*b[i]
+    d1 += (a[i] - b[i])*(a[i] - b[i])
+    d2 += (a[i] + b[i])*(a[i] + b[i])
   }
-  return dot
-}*/
+  return d1 <= d2 ? d1 : d2
+}
 
 function compareLex(A,B) {
   var n = A.length
